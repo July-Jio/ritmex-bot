@@ -14,7 +14,9 @@ import {
   getSMA,
   type PositionSnapshot,
 } from "../utils/strategy";
-import { computePositionPnl } from "../utils/pnl";
+import { computePositionPnl, computeNetPnl, computeGrossPnl } from "../utils/pnl";
+import { TradeTracker, type TradeStats } from "../utils/trade-tracker";
+import { getFeeConfig } from "../utils/fees";
 import { getMidOrLast } from "../utils/price";
 import {
   marketClose,
@@ -36,10 +38,14 @@ export interface TrendEngineSnapshot {
   trend: "做多" | "做空" | "无信号";
   position: PositionSnapshot;
   pnl: number;
+  grossPnl: number;
+  netPnl: number;
+  totalFees: number;
   unrealized: number;
   totalProfit: number;
   totalTrades: number;
   sessionVolume: number;
+  tradeStats: TradeStats;
   tradeLog: TradeLogEntry[];
   openOrders: AsterOrder[];
   depth: AsterDepth | null;
@@ -69,6 +75,8 @@ export class TrendEngine {
   private readonly pending: OrderPendingMap = {};
 
   private readonly tradeLog: ReturnType<typeof createTradeLog>;
+  private readonly tradeTracker: TradeTracker;
+  private readonly feeConfig = getFeeConfig();
 
   private timer: ReturnType<typeof setInterval> | null = null;
   private processing = false;
@@ -91,6 +99,7 @@ export class TrendEngine {
 
   constructor(private readonly config: TradingConfig, private readonly exchange: ExchangeAdapter) {
     this.tradeLog = createTradeLog(this.config.maxLogEntries);
+    this.tradeTracker = new TradeTracker(this.feeConfig);
     this.bootstrap();
   }
 
@@ -603,7 +612,13 @@ export class TrendEngine {
       : price < sma30
       ? "做空"
       : "无信号";
-    const pnl = price != null ? computePositionPnl(position, price, price) : 0;
+    
+    // 计算各种盈亏指标
+    const grossPnl = price != null ? computeGrossPnl(position, price, price) : 0;
+    const tradeStats = this.tradeTracker.getStats();
+    const netPnl = price != null ? computeNetPnl(position, price, price, tradeStats.totalFees) : 0;
+    const pnl = netPnl; // 使用净盈亏作为主要指标
+    
     return {
       ready: this.isReady(),
       symbol: this.config.symbol,
@@ -612,10 +627,14 @@ export class TrendEngine {
       trend,
       position,
       pnl,
+      grossPnl,
+      netPnl,
+      totalFees: tradeStats.totalFees,
       unrealized: position.unrealizedProfit,
       totalProfit: this.totalProfit,
       totalTrades: this.totalTrades,
       sessionVolume: this.sessionQuoteVolume,
+      tradeStats,
       tradeLog: this.tradeLog.all(),
       openOrders: this.openOrders,
       depth: this.depthSnapshot,

@@ -1,5 +1,7 @@
 import crypto from "crypto";
 import { setInterval, clearInterval, setTimeout, clearTimeout } from "timers";
+import { safeFetch } from "../../utils/http";
+import { logger } from "../../utils/logger";
 import type {
   AsterAccountPosition,
   AsterAccountSnapshot,
@@ -222,7 +224,7 @@ class SimpleEvent<T> {
       try {
         listener(payload);
       } catch (error) {
-        console.error("[SimpleEvent] listener failure", error);
+        logger.error("[SimpleEvent] listener failure", error instanceof Error ? error.message : String(error));
       }
     }
   }
@@ -291,7 +293,11 @@ export class AsterRestClient {
     const url = `${REST_BASE}/fapi/v1/continuousKlines?pair=${upper}&contractType=PERPETUAL&interval=${encodeURIComponent(interval)}&limit=${limit}`;
     let response: Response;
     try {
-      response = await fetch(url);
+      response = await safeFetch(url, {
+        timeout: { timeoutMs: 10_000 },
+        retry: { maxRetries: 2, baseDelayMs: 300, maxDelayMs: 2000, retryOnStatuses: [408, 429, 500, 502, 503, 504] },
+        description: "AsterRestClient.getKlines",
+      });
     } catch (error) {
       throw new Error(`[AsterRestClient] 获取K线失败 ${String(error)}`);
     }
@@ -335,7 +341,12 @@ export class AsterRestClient {
     };
     let response: Response;
     try {
-      response = await fetch(url, init);
+      response = await safeFetch(url, {
+        ...init,
+        timeout: { timeoutMs: 10_000 },
+        retry: { maxRetries: 2, baseDelayMs: 300, maxDelayMs: 2000, retryOnStatuses: [408, 429, 500, 502, 503, 504] },
+        description: `AsterRestClient.signedRequest ${method} ${path}`,
+      });
     } catch (error) {
       throw new Error(`[AsterRestClient] 请求失败 ${String(error)}`);
     }
@@ -444,7 +455,7 @@ export class AsterPublicStreams {
         try {
           payload = JSON.parse(event.data);
         } catch (error) {
-          console.error("[AsterPublicStreams] 无法解析消息", error, event.data);
+          logger.error("[AsterPublicStreams] 无法解析消息", { error: error instanceof Error ? error.message : String(error) });
           return;
         }
       } else {
@@ -584,7 +595,7 @@ export class AsterUserStream {
     this.keepAliveTimer = setInterval(() => {
       if (!this.listenKey) return;
       void this.rest.keepAliveListenKey(this.listenKey).catch((error) => {
-        console.error("[AsterUserStream] keepAlive error", error);
+        logger.error("[AsterUserStream] keepAlive error", error instanceof Error ? error.message : String(error));
       });
     }, LISTEN_KEY_KEEPALIVE_MS / 2);
   }
@@ -605,7 +616,7 @@ export class AsterUserStream {
         try {
           payload = JSON.parse(event.data);
         } catch (error) {
-          console.error("[AsterUserStream] 无法解析消息", error, event.data);
+          logger.error("[AsterUserStream] 无法解析消息", { error: error instanceof Error ? error.message : String(error) });
           return;
         }
       } else {
@@ -660,6 +671,11 @@ function updateAccountSnapshot(snapshot: AsterAccountSnapshot | null, event: { e
   if (!next) return snapshot;
   next.updateTime = event.eventTime;
   const balances = event.payload.B ?? [];
+  
+  // 计算总钱包余额（基于USDT资产）
+  let totalWalletBalance = 0;
+  
+  // 更新资产余额
   for (const balance of balances) {
     const asset = balance.a;
     let assetEntry = next.assets.find((item) => item.asset === asset);
@@ -672,12 +688,24 @@ function updateAccountSnapshot(snapshot: AsterAccountSnapshot | null, event: { e
       };
       next.assets.push(assetEntry);
     }
-    if (balance.wb !== undefined) assetEntry.walletBalance = balance.wb;
+    if (balance.wb !== undefined) {
+      assetEntry.walletBalance = balance.wb;
+      // 累加USDT余额到总钱包余额
+      if (asset === "USDT") {
+        totalWalletBalance += parseFloat(balance.wb);
+      }
+    }
     if (balance.cw !== undefined) assetEntry.crossWalletBalance = balance.cw;
     if (balance.bc !== undefined) assetEntry.availableBalance = balance.bc;
     assetEntry.updateTime = event.eventTime;
   }
+  
+  // 更新总钱包余额
+  if (totalWalletBalance > 0) {
+    next.totalWalletBalance = totalWalletBalance.toFixed(8);
+  }
 
+  // 更新持仓信息
   const positions = event.payload.P ?? [];
   const unrealizedTotals = positions.reduce((acc, item) => acc + parseFloat(item.up ?? "0"), 0);
   next.totalUnrealizedProfit = unrealizedTotals.toFixed(8);
@@ -701,6 +729,7 @@ function updateAccountSnapshot(snapshot: AsterAccountSnapshot | null, event: { e
     positionEntry.unrealizedProfit = position.up ?? positionEntry.unrealizedProfit;
     positionEntry.updateTime = event.eventTime;
   }
+  
   return next;
 }
 
@@ -720,7 +749,9 @@ export class AsterGateway {
   private accountSnapshot: AsterAccountSnapshot | null = null;
   private readonly openOrders = new Map<number, AsterOrder>();
   private positionSyncTimer: ReturnType<typeof setInterval> | null = null;
+  private accountSyncTimer: ReturnType<typeof setInterval> | null = null;
   private positionSyncInFlight = false;
+  private accountSyncInFlight = false;
 
   private readonly accountEvent = new SimpleEvent<AsterAccountSnapshot>();
   private readonly ordersEvent = new SimpleEvent<AsterOrder[]>();
@@ -768,6 +799,7 @@ export class AsterGateway {
       this.initialized = true;
       await this.userStream.start();
       this.startPositionSync();
+      this.startAccountSync();
     })().catch((error) => {
       this.initializing = null;
       throw error;
@@ -862,7 +894,7 @@ export class AsterGateway {
           event.emit([...klines]);
         }
       } catch (error) {
-        console.error("[AsterGateway] seed klines failed", error);
+        logger.error("[AsterGateway] seed klines failed", error instanceof Error ? error.message : String(error));
       } finally {
         this.startKlineRefresh(symbol, interval);
       }
@@ -884,7 +916,7 @@ export class AsterGateway {
           event.emit([...klines]);
         }
       } catch (error) {
-        console.error("[AsterGateway] refresh klines failed", error);
+        logger.error("[AsterGateway] refresh klines failed", error instanceof Error ? error.message : String(error));
       }
     }, KLINE_REFRESH_INTERVAL_MS);
     this.klineRefreshTimers.set(key, timer);
@@ -900,7 +932,7 @@ export class AsterGateway {
           positions = latestPositions;
         }
       } catch (positionError) {
-        console.error("[AsterGateway] 刷新持仓失败", positionError);
+        logger.error("[AsterGateway] 刷新持仓失败", positionError instanceof Error ? positionError.message : String(positionError));
       }
       const normalizedPositions = clonePositions(positions);
       const snapshot: AsterAccountSnapshot = {
@@ -912,7 +944,7 @@ export class AsterGateway {
       this.accountSnapshot = snapshot;
       this.accountEvent.emit(snapshot);
     } catch (error) {
-      console.error("[AsterGateway] 刷新账户信息失败", error);
+      logger.error("[AsterGateway] 刷新账户信息失败", error instanceof Error ? error.message : String(error));
     }
     try {
       const orders = await this.rest.getOpenOrders();
@@ -920,7 +952,7 @@ export class AsterGateway {
       orders.forEach((order) => mergeOrderSnapshot(this.openOrders, order));
       this.ordersEvent.emit(Array.from(this.openOrders.values()));
     } catch (error) {
-      console.error("[AsterGateway] 刷新挂单失败", error);
+      logger.error("[AsterGateway] 刷新挂单失败", error instanceof Error ? error.message : String(error));
     }
   }
 
@@ -933,6 +965,16 @@ export class AsterGateway {
     this.positionSyncTimer = setInterval(tick, POSITION_SYNC_INTERVAL_MS);
   }
 
+  private startAccountSync(): void {
+    if (this.accountSyncTimer) return;
+    const tick = () => {
+      void this.refreshAccount();
+    };
+    void this.refreshAccount();
+    // 每30秒刷新一次账户信息
+    this.accountSyncTimer = setInterval(tick, 30000);
+  }
+
   private async refreshPositions(): Promise<void> {
     if (this.positionSyncInFlight) return;
     this.positionSyncInFlight = true;
@@ -941,19 +983,35 @@ export class AsterGateway {
       if (!Array.isArray(positions)) return;
       const normalizedPositions = clonePositions(positions);
       if (!this.accountSnapshot) {
-        const snapshot: AsterAccountSnapshot = {
-          canTrade: true,
-          canDeposit: true,
-          canWithdraw: true,
-          updateTime: Date.now(),
-          totalWalletBalance: "0",
-          totalUnrealizedProfit: sumUnrealizedProfit(normalizedPositions),
-          positions: normalizedPositions,
-          assets: [],
-        };
-        this.accountSnapshot = snapshot;
-        this.accountEvent.emit(snapshot);
-        return;
+        // 如果没有账户快照，先获取完整的账户信息
+        try {
+          const account = await this.rest.getAccount();
+          const snapshot: AsterAccountSnapshot = {
+            ...account,
+            positions: normalizedPositions,
+            totalUnrealizedProfit: sumUnrealizedProfit(normalizedPositions),
+            updateTime: Date.now(),
+          };
+          this.accountSnapshot = snapshot;
+          this.accountEvent.emit(snapshot);
+          return;
+        } catch (accountError) {
+          logger.error("[AsterGateway] 获取账户信息失败", accountError instanceof Error ? accountError.message : String(accountError));
+          // 如果获取账户信息失败，使用默认值
+          const snapshot: AsterAccountSnapshot = {
+            canTrade: true,
+            canDeposit: true,
+            canWithdraw: true,
+            updateTime: Date.now(),
+            totalWalletBalance: "0",
+            totalUnrealizedProfit: sumUnrealizedProfit(normalizedPositions),
+            positions: normalizedPositions,
+            assets: [],
+          };
+          this.accountSnapshot = snapshot;
+          this.accountEvent.emit(snapshot);
+          return;
+        }
       }
       const nextSnapshot: AsterAccountSnapshot = {
         ...this.accountSnapshot,
@@ -964,9 +1022,33 @@ export class AsterGateway {
       this.accountSnapshot = nextSnapshot;
       this.accountEvent.emit(nextSnapshot);
     } catch (error) {
-      console.error("[AsterGateway] 同步持仓失败", error);
+      logger.error("[AsterGateway] 同步持仓失败", error instanceof Error ? error.message : String(error));
     } finally {
       this.positionSyncInFlight = false;
+    }
+  }
+
+  private async refreshAccount(): Promise<void> {
+    if (this.accountSyncInFlight) return;
+    this.accountSyncInFlight = true;
+    try {
+      const account = await this.rest.getAccount();
+      const positions = await this.rest.getPositions();
+      const normalizedPositions = Array.isArray(positions) ? clonePositions(positions) : [];
+      
+      const snapshot: AsterAccountSnapshot = {
+        ...account,
+        positions: normalizedPositions,
+        totalUnrealizedProfit: sumUnrealizedProfit(normalizedPositions),
+        updateTime: Date.now(),
+      };
+      
+      this.accountSnapshot = snapshot;
+      this.accountEvent.emit(snapshot);
+    } catch (error) {
+      logger.error("[AsterGateway] 同步账户信息失败", error instanceof Error ? error.message : String(error));
+    } finally {
+      this.accountSyncInFlight = false;
     }
   }
 

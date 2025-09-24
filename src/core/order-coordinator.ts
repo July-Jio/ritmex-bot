@@ -41,6 +41,19 @@ function enforceMarkPriceGuard(
   return true;
 }
 
+// 对小额下单数量做离散随机：在 [0.001, 0.005] 内随机选择步长 0.001 的值
+// 仅当入参 amount 已处于该范围内时生效；其他数量（如平仓或自定义量）不改动。
+function chooseDiscreteQty(amount: number): number {
+  const min = 0.001;
+  const max = 0.005;
+  if (amount >= min && amount <= max) {
+    const options = [0.001, 0.002, 0.003, 0.004, 0.005];
+    const idx = Math.floor(Math.random() * options.length);
+    return options[idx];
+  }
+  return amount;
+}
+
 export function isOperating(locks: OrderLockMap, type: string): boolean {
   return Boolean(locks[type]);
 }
@@ -135,7 +148,7 @@ export async function placeOrder(
     symbol,
     side,
     type,
-    quantity: toQty3Decimal(amount),
+    quantity: toQty3Decimal(chooseDiscreteQty(amount)),
     price: toPrice1Decimal(price),
     timeInForce: "GTX",
   };
@@ -177,7 +190,7 @@ export async function placeMarketOrder(
     symbol,
     side,
     type,
-    quantity: toQty3Decimal(amount),
+    quantity: toQty3Decimal(chooseDiscreteQty(amount)),
   };
   if (reduceOnly) params.reduceOnly = "true";
   await deduplicateOrders(adapter, symbol, openOrders, locks, timers, pendings, type, side, log);

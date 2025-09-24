@@ -10,9 +10,13 @@ import { toPrice1Decimal } from "../utils/math";
 import { createTradeLog, type TradeLogEntry } from "../state/trade-log";
 import { isUnknownOrderError } from "../utils/errors";
 import { getPosition, type PositionSnapshot } from "../utils/strategy";
-import { computePositionPnl } from "../utils/pnl";
+import { computePositionPnl, computeNetPnl, computeGrossPnl } from "../utils/pnl";
 import { getTopPrices, getMidOrLast } from "../utils/price";
 import { shouldStopLoss } from "../utils/risk";
+import { TradeTracker, type TradeStats } from "../utils/trade-tracker";
+import { getFeeConfig } from "../utils/fees";
+import { VolumeStrategyOptimizer, type VolumeMetrics } from "../utils/volume-strategy";
+import { CloseStrategyManager, type CloseOrderInfo } from "../utils/close-strategy";
 import {
   marketClose,
   placeOrder,
@@ -37,8 +41,14 @@ export interface MakerEngineSnapshot {
   spread: number | null;
   position: PositionSnapshot;
   pnl: number;
+  grossPnl: number;
+  netPnl: number;
+  totalFees: number;
   accountUnrealized: number;
+  accountBalance: number;
   sessionVolume: number;
+  tradeStats: TradeStats;
+  volumeMetrics: VolumeMetrics;
   openOrders: AsterOrder[];
   desiredOrders: DesiredOrder[];
   tradeLog: TradeLogEntry[];
@@ -62,6 +72,10 @@ export class MakerEngine {
   private readonly pendingCancelOrders = new Set<number>();
 
   private readonly tradeLog: ReturnType<typeof createTradeLog>;
+  private readonly tradeTracker: TradeTracker;
+  private readonly volumeOptimizer: VolumeStrategyOptimizer;
+  private readonly closeStrategy: CloseStrategyManager;
+  private readonly feeConfig = getFeeConfig();
   private readonly listeners = new Map<MakerEvent, Set<MakerListener>>();
 
   private timer: ReturnType<typeof setInterval> | null = null;
@@ -77,6 +91,21 @@ export class MakerEngine {
 
   constructor(private readonly config: MakerConfig, private readonly exchange: ExchangeAdapter) {
     this.tradeLog = createTradeLog(this.config.maxLogEntries);
+    this.tradeTracker = new TradeTracker(this.feeConfig);
+    this.volumeOptimizer = new VolumeStrategyOptimizer({
+      maxVolumePerMinute: 100,
+      targetVolumePerHour: 5000,
+      minTradeInterval: 1000,
+      maxPositionHoldTime: 30000,
+      quickCloseThreshold: 0.001,
+      maxDrawdownPerTrade: 0.002,
+      aggressivePricing: true,
+    });
+    this.closeStrategy = new CloseStrategyManager({
+      minProfitMargin: 0.0001,  // 0.01% 最小盈利边际
+      timeoutMs: 60000,         // 1分钟超时
+      fallbackToOriginal: true, // 超时后回退到原策略
+    });
     this.bootstrap();
   }
 
@@ -137,9 +166,23 @@ export class MakerEngine {
       this.exchange.watchOrders((orders) => {
         try {
           this.syncLocksWithOrders(orders);
+          const previousOrderIds = new Set(this.openOrders.map(order => order.orderId));
           this.openOrders = Array.isArray(orders)
             ? orders.filter((order) => order.type !== "MARKET" && order.symbol === this.config.symbol)
             : [];
+          
+          // 检查是否有订单成交
+          const currentOrderIds = new Set(this.openOrders.map(order => order.orderId));
+          for (const orderId of previousOrderIds) {
+            if (!currentOrderIds.has(orderId)) {
+              // 订单已成交或取消，需要记录交易
+              const filledOrder = orders?.find(order => order.orderId === orderId);
+              if (filledOrder && filledOrder.status === "FILLED") {
+                this.handleOrderFilled(filledOrder);
+              }
+            }
+          }
+          
           const currentIds = new Set(this.openOrders.map((order) => order.orderId));
           for (const id of Array.from(this.pendingCancelOrders)) {
             if (!currentIds.has(id)) {
@@ -244,8 +287,61 @@ export class MakerEngine {
         desired.push({ side: "SELL", price: askPrice, amount: this.config.tradeAmount, reduceOnly: false });
       } else {
         const closeSide: "BUY" | "SELL" = position.positionAmt > 0 ? "SELL" : "BUY";
-        const closePrice = closeSide === "SELL" ? askPrice : bidPrice;
-        desired.push({ side: closeSide, price: closePrice, amount: absPosition, reduceOnly: true });
+        
+        // 使用新的平仓策略
+        const closeInfo = this.closeStrategy.calculateClosePrice(
+          position.entryPrice,
+          absPosition,
+          closeSide,
+          bidPrice,
+          askPrice
+        );
+        
+        // 检查是否应该使用市价单平仓
+        if (this.closeStrategy.shouldUseMarketClose(
+          position.entryPrice,
+          absPosition,
+          closeSide,
+          bidPrice,
+          askPrice
+        )) {
+          // 使用市价单平仓
+          this.tradeLog.push("close", `市价平仓: ${closeSide} (策略: ${closeInfo.strategy})`);
+          try {
+            await marketClose(
+              this.exchange,
+              this.config.symbol,
+              this.openOrders,
+              this.locks,
+              this.timers,
+              this.pending,
+              closeSide,
+              absPosition,
+              (type, detail) => this.tradeLog.push(type, detail),
+              {
+                markPrice: position.markPrice,
+                expectedPrice: closeSide === "SELL" ? bidPrice : askPrice,
+                maxPct: this.config.maxCloseSlippagePct,
+              }
+            );
+            this.closeStrategy.stopCloseStrategy();
+          } catch (error) {
+            this.tradeLog.push("error", `市价平仓失败: ${String(error)}`);
+          }
+        } else {
+          // 使用限价单平仓
+          desired.push({ 
+            side: closeSide, 
+            price: closeInfo.price, 
+            amount: absPosition, 
+            reduceOnly: true 
+          });
+          
+          if (closeInfo.strategy === "profit_cover") {
+            this.tradeLog.push("close", `限价平仓: ${closeSide} @ ${closeInfo.price.toFixed(4)} (覆盖手续费)`);
+            this.closeStrategy.startCloseStrategy();
+          }
+        }
       }
 
       this.desiredOrders = desired;
@@ -449,7 +545,20 @@ export class MakerEngine {
     const position = getPosition(this.accountSnapshot, this.config.symbol);
     const { topBid, topAsk } = getTopPrices(this.depthSnapshot);
     const spread = topBid != null && topAsk != null ? topAsk - topBid : null;
-    const pnl = computePositionPnl(position, topBid, topAsk);
+    
+    // 计算各种盈亏指标
+    const grossPnl = computeGrossPnl(position, topBid, topAsk);
+    const tradeStats = this.tradeTracker.getStats();
+    const netPnl = computeNetPnl(position, topBid, topAsk, tradeStats.totalFees);
+    const pnl = netPnl; // 使用净盈亏作为主要指标
+    
+    // 获取账户余额 - 使用API返回的totalWalletBalance
+    const accountBalance = this.accountSnapshot 
+      ? parseFloat(this.accountSnapshot.totalWalletBalance || "0") 
+      : 0;
+    
+    // 获取交易量指标
+    const volumeMetrics = this.volumeOptimizer.getVolumeMetrics();
 
     return {
       ready: this.isReady(),
@@ -459,8 +568,14 @@ export class MakerEngine {
       spread,
       position,
       pnl,
+      grossPnl,
+      netPnl,
+      totalFees: tradeStats.totalFees,
       accountUnrealized: this.accountUnrealized,
+      accountBalance,
       sessionVolume: this.sessionQuoteVolume,
+      tradeStats,
+      volumeMetrics,
       openOrders: this.openOrders,
       desiredOrders: this.desiredOrders,
       tradeLog: this.tradeLog.all(),
@@ -488,5 +603,44 @@ export class MakerEngine {
 
   private getReferencePrice(): number | null {
     return getMidOrLast(this.depthSnapshot, this.tickerSnapshot);
+  }
+
+  private handleOrderFilled(order: AsterOrder): void {
+    try {
+      const price = this.getReferencePrice();
+      if (price == null) return;
+
+      const executedQty = parseFloat(order.executedQty || "0");
+      const avgPrice = parseFloat(order.avgPrice || order.price || "0");
+      const notional = executedQty * avgPrice;
+      
+      if (notional > 0) {
+        // 记录到TradeTracker - 使用真实的交易数据
+        this.tradeTracker.addTradeFromOrderUpdate({
+          orderId: order.orderId,
+          symbol: order.symbol,
+          side: order.side,
+          price: order.price,
+          avgPrice: order.avgPrice || order.price,
+          origQty: order.origQty,
+          executedQty: order.executedQty,
+          cumQuote: order.cumQuote,
+          commission: order.commission || "0",
+          commissionAsset: order.commissionAsset || "USDT",
+          isMaker: order.type === "LIMIT", // 限价单默认为maker
+          type: order.type,
+        });
+
+        // 记录到VolumeOptimizer
+        this.volumeOptimizer.recordTrade(notional, 0, 0); // 临时记录，实际需要计算PnL
+
+        // 更新会话交易量
+        this.sessionQuoteVolume += notional;
+
+        this.tradeLog.push("trade", `订单成交: ${order.side} ${executedQty} @ ${avgPrice} (${order.type}) 手续费: ${order.commission || "0"} ${order.commissionAsset || "USDT"}`);
+      }
+    } catch (error) {
+      this.tradeLog.push("error", `处理订单成交失败: ${String(error)}`);
+    }
   }
 }
